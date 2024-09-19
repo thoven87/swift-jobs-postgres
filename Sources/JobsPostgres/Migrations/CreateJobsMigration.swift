@@ -37,14 +37,14 @@ struct CreateJobsMigration: DatabaseMigration {
         )
         try await connection.query(
             """
-            CREATE INDEX IF NOT EXISTS _hb_job_status_idx
+            CREATE INDEX IF NOT EXISTS _swift_jobs_status_idx
             ON swift_jobs(status)
             """,
             logger: logger
         )
         try await connection.query(
             """
-            CREATE INDEX IF NOT EXISTS _hb_job_filter_idx
+            CREATE INDEX IF NOT EXISTS _swift_jobs_filter_idx
             ON swift_jobs(priority, created_at, delayed_until)
             """,
             logger: logger
@@ -58,7 +58,7 @@ struct CreateJobsMigration: DatabaseMigration {
         )
     }
 
-    var name: String { "_Create_Jobs_Table_" }
+    var name: String { "_Create_SwiftJobs_Table_" }
     var group: DatabaseMigrationGroup { .jobQueue }
 }
 
