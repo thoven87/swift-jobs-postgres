@@ -77,17 +77,20 @@ public final class PostgresJobQueue: JobQueueDriver {
         let failedJobsInitialization: JobInitialization
         let processingJobsInitialization: JobInitialization
         let pollTime: Duration
+        let concurrency: Int
 
         public init(
             pendingJobsInitialization: JobInitialization = .doNothing,
             failedJobsInitialization: JobInitialization = .rerun,
             processingJobsInitialization: JobInitialization = .rerun,
-            pollTime: Duration = .milliseconds(100)
+            pollTime: Duration = .milliseconds(100),
+            concurrency: Int = 1
         ) {
             self.pendingJobsInitialization = pendingJobsInitialization
             self.failedJobsInitialization = failedJobsInitialization
             self.processingJobsInitialization = processingJobsInitialization
             self.pollTime = pollTime
+            self.concurrency = concurrency
         }
     }
 
@@ -124,7 +127,7 @@ public final class PostgresJobQueue: JobQueueDriver {
                 try await self.updateJobsOnInit(withStatus: .failed, onInit: self.configuration.failedJobsInitialization, connection: connection)
             }
         } catch let error as PSQLError {
-            print("\(String(reflecting: error))")
+            self.logger.error("\(String(reflecting: error))")
             throw error
         }
     }
@@ -133,7 +136,7 @@ public final class PostgresJobQueue: JobQueueDriver {
     /// - Returns: Identifier of queued job
     @discardableResult public func push(_ buffer: ByteBuffer, options: JobOptions) async throws -> JobID {
         let queuedJob = QueuedJob<JobID>(id: .init(), jobBuffer: buffer)
-        try await self.addJob(queuedJob, buffer: buffer, options: options)
+        try await self.addJob(queuedJob, options: options)
         return queuedJob.id
     }
 
@@ -263,7 +266,7 @@ public final class PostgresJobQueue: JobQueueDriver {
                                 AND (delayed_until IS NULL OR delayed_until <= NOW())
                                 ORDER BY priority, created_at, delayed_until ASC
                                 FOR UPDATE SKIP LOCKED
-                                LIMIT 10
+                                LIMIT \(self.configuration.concurrency)
                             )
                             UPDATE swift_jobs
                             SET status = 0
@@ -306,10 +309,10 @@ public final class PostgresJobQueue: JobQueueDriver {
             throw error
         }
     }
-
-    func addJob(_ job: QueuedJob<JobID>, buffer: ByteBuffer, options: JobOptions) async throws {
+    // TODO: make priority available in JobOptions
+    func addJob(_ job: QueuedJob<JobID>, options: JobOptions) async throws {
         // TODO: use just buffer and status
-        let key = "\(buffer)\(Status.pending)\(job.id)"
+        let key = "\(job.jobBuffer)\(Status.pending)\(job.id)"
         let debouceKey = SHA256.hash(data: Data(key.utf8)).compactMap {
             String(format: "%02x", $0)
         }.joined()
@@ -327,7 +330,7 @@ public final class PostgresJobQueue: JobQueueDriver {
             VALUES(
                 \(job.id),
                 'DEFAULT', -- TODO: take in job name
-                \(buffer),
+                \(job.jobBuffer),
                 \(Status.pending),
                 \(options.delayUntil),
                 \(debouceKey),
