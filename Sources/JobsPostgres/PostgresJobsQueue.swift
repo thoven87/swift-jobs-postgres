@@ -11,7 +11,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 //===----------------------------------------------------------------------===//
-
+import CryptoKit
 import Foundation
 import Jobs
 import Logging
@@ -108,10 +108,8 @@ public final class PostgresJobQueue: JobQueueDriver {
         self.logger = logger
         self.isStopped = .init(false)
         self.migrations = migrations
-        await migrations.add(CreateJobs())
-        await migrations.add(CreateJobQueue())
         await migrations.add(CreateJobQueueMetadata())
-        await migrations.add(CreateJobDelay())
+        await migrations.add(CreateJobsMigration())
     }
 
     /// Run on initialization of the job queue
@@ -134,10 +132,9 @@ public final class PostgresJobQueue: JobQueueDriver {
     /// Push Job onto queue
     /// - Returns: Identifier of queued job
     @discardableResult public func push(_ buffer: ByteBuffer, options: JobOptions) async throws -> JobID {
-        try await self.client.withTransaction(logger: self.logger) { connection in
+        return try await self.client.withConnection { connection in
             let queuedJob = QueuedJob<JobID>(id: .init(), jobBuffer: buffer)
-            try await self.add(queuedJob, connection: connection)
-            try await self.addToQueue(jobId: queuedJob.id, connection: connection, delayUntil: options.delayUntil)
+            try await self.addJob(queuedJob, buffer: buffer, options: options, connection: self.client)
             return queuedJob.id
         }
     }
@@ -187,42 +184,114 @@ public final class PostgresJobQueue: JobQueueDriver {
             let result = try await self.client.withTransaction(logger: self.logger) { connection -> Result<QueuedJob<JobID>?, Error> in
                 while true {
                     try Task.checkCancellation()
-
-                    let stream = try await connection.query(
-                        """
-                        DELETE FROM
-                            _hb_pg_job_queue
-                        USING (
-                            SELECT job_id FROM _hb_pg_job_queue
-                            WHERE (delayed_until IS NULL OR delayed_until <= NOW())
-                            ORDER BY createdAt, delayed_until ASC
-                            LIMIT 1
-                            FOR UPDATE SKIP LOCKED
-                        ) queued
-                        WHERE queued.job_id = _hb_pg_job_queue.job_id
-                        RETURNING _hb_pg_job_queue.job_id
-                        """,
-                        logger: self.logger
-                    )
-                    // return nil if nothing in queue
-                    guard let jobId = try await stream.decode(UUID.self, context: .default).first(where: { _ in true }) else {
-                        return Result.success(nil)
-                    }
-                    // select job from job table
-                    let stream2 = try await connection.query(
-                        "SELECT job FROM _hb_pg_jobs WHERE id = \(jobId) FOR UPDATE SKIP LOCKED",
-                        logger: self.logger
-                    )
+                    
+                    var maybeFailedJobId: JobID? = nil
 
                     do {
-                        try await self.setStatus(jobId: jobId, status: .processing, connection: connection)
-                        // if failed to find a job in the job table try getting another index
-                        guard let buffer = try await stream2.decode(ByteBuffer.self, context: .default).first(where: { _ in true }) else {
+                        
+                        let stream = try await connection.query(
+                            """
+                            WITH eligible_jobs AS (
+                                SELECT
+                                    id
+                                FROM swift_jobs
+                                WHERE status = \(Status.pending)
+                                AND (delayed_until IS NULL OR delayed_until <= NOW())
+                                ORDER BY priority, created_at, delayed_until ASC
+                                FOR UPDATE SKIP LOCKED
+                                LIMIT 1
+                            )
+                            UPDATE swift_jobs
+                            SET status = \(Status.processing)
+                            FROM eligible_jobs
+                            WHERE swift_jobs.id = eligible_jobs.id
+                            RETURNING swift_jobs.id, swift_jobs.payload
+                            """,
+                            logger: self.logger
+                        )
+                        // return nil if nothing is in the queue
+                        let (jobId, buffer) = try await stream.decode((UUID, ByteBuffer).self, context: .default).first(where: { _ in true }) ?? (nil, nil)
+                        
+                        guard let jobId else {
+                            // return nil if nothing in queue
+                            return Result.success(nil)
+                        }
+                        
+                        maybeFailedJobId = jobId
+                        
+                        guard let buffer = buffer else {
                             continue
                         }
                         return Result.success(QueuedJob(id: jobId, jobBuffer: buffer))
                     } catch {
-                        try await self.setStatus(jobId: jobId, status: .failed, connection: connection)
+                        /// Job Id should be set if we get here
+                        if let jobId = maybeFailedJobId {
+                            try await self.setStatus(jobId: jobId, status: .failed, connection: connection)
+                        }
+                        return Result.failure(JobQueueError.decodeJobFailed)
+                    }
+                }
+            }
+            return try result.get()
+        } catch let error as PSQLError {
+            logger.error("Failed to get job from queue", metadata: [
+                "error": "\(String(reflecting: error))",
+            ])
+            throw error
+        } catch let error as JobQueueError {
+            logger.error("Job failed", metadata: [
+                "error": "\(String(reflecting: error))",
+            ])
+            throw error
+        }
+    }
+    /// TODO use this func for concurency 
+    func popMany() async throws -> [QueuedJob<JobID>]? {
+        do {
+            let result = try await self.client.withTransaction(logger: self.logger) { connection -> Result<[QueuedJob<JobID>]?, Error> in
+                while true {
+                    try Task.checkCancellation()
+                    
+                    var jobs: [QueuedJob<JobID>] = []
+                    
+                    do {
+                        
+                        let stream = try await connection.query(
+                            """
+                            WITH eligible_jobs AS (
+                                SELECT
+                                    id
+                                FROM swift_jobs
+                                WHERE status = 0
+                                AND (delayed_until IS NULL OR delayed_until <= NOW())
+                                ORDER BY priority, created_at, delayed_until ASC
+                                FOR UPDATE SKIP LOCKED
+                                LIMIT 10
+                            )
+                            UPDATE swift_jobs
+                            SET status = 0
+                            FROM eligible_jobs
+                            WHERE swift_jobs.id = eligible_jobs.id
+                            RETURNING swift_jobs.id, swift_jobs.payload
+                            """,
+                            logger: self.logger
+                        )
+                        
+                        for try await (jobId, buffer) in stream.decode((UUID, ByteBuffer).self) {
+                            jobs.append(QueuedJob(id: jobId, jobBuffer: buffer))
+                        }
+                        
+                        guard !jobs.isEmpty else {
+                            // return nil if nothing in queue
+                            return Result.success(nil)
+                        }
+                        
+                        return Result.success(jobs)
+                    } catch {
+                        /// Job Id should be set if we get here
+                        for job in jobs {
+                            try await self.setStatus(jobId: job.id, status: .failed, connection: connection)
+                        }
                         return Result.failure(JobQueueError.decodeJobFailed)
                     }
                 }
@@ -241,52 +310,64 @@ public final class PostgresJobQueue: JobQueueDriver {
         }
     }
 
-    func add(_ job: QueuedJob<JobID>, connection: PostgresConnection) async throws {
+    func addJob(_ job: QueuedJob<JobID>, buffer: ByteBuffer, options: JobOptions, connection: PostgresClient) async throws {
+        // TODO: use just buffer and status
+        let key: String = "\(buffer)\(Status.pending)\(job.id)"
+        let debouceKey = SHA256.hash(data: Data(key.utf8)).compactMap {
+            String(format: "%02x", $0)
+        }.joined()
         try await connection.query(
             """
-            INSERT INTO _hb_pg_jobs (id, job, status)
-            VALUES (\(job.id), \(job.jobBuffer), \(Status.pending))
+            INSERT INTO swift_jobs (
+                id,
+                job_name,
+                payload,
+                status,
+                delayed_until,
+                debounce_key,
+                priority
+            )
+            VALUES(
+                \(job.id),
+                'DEFAULT', -- TODO: take in job name
+                \(buffer),
+                \(Status.pending),
+                \(options.delayUntil),
+                \(debouceKey),
+                10
+            )
+            ON CONFLICT (debounce_key)
+            DO UPDATE SET delayed_until = \(options.delayUntil), updated_at = \(Date.now)
             """,
-            logger: self.logger
+            logger: logger
         )
     }
 
     func delete(jobId: JobID) async throws {
         try await self.client.query(
-            "DELETE FROM _hb_pg_jobs WHERE id = \(jobId)",
+            "DELETE FROM swift_jobs WHERE id = \(jobId)",
             logger: self.logger
         )
     }
 
-    func addToQueue(jobId: JobID, connection: PostgresConnection, delayUntil: Date?) async throws {
-        try await connection.query(
-            """
-            INSERT INTO _hb_pg_job_queue (job_id, createdAt, delayed_until)
-            VALUES (\(jobId), \(Date.now), \(delayUntil))
-            ON CONFLICT (job_id)
-            DO UPDATE SET delayed_until = \(delayUntil)
-            """,
-            logger: self.logger
-        )
-    }
 
     func setStatus(jobId: JobID, status: Status, connection: PostgresConnection) async throws {
         try await connection.query(
-            "UPDATE _hb_pg_jobs SET status = \(status), lastModified = \(Date.now) WHERE id = \(jobId)",
+            "UPDATE swift_jobs SET status = \(status), updated_at = \(Date.now) WHERE id = \(jobId)",
             logger: self.logger
         )
     }
 
     func setStatus(jobId: JobID, status: Status) async throws {
         try await self.client.query(
-            "UPDATE _hb_pg_jobs SET status = \(status), lastModified = \(Date.now) WHERE id = \(jobId)",
+            "UPDATE swift_jobs SET status = \(status), updated_at = \(Date.now) WHERE id = \(jobId)",
             logger: self.logger
         )
     }
 
     func getJobs(withStatus status: Status) async throws -> [JobID] {
         let stream = try await self.client.query(
-            "SELECT id FROM _hb_pg_jobs WHERE status = \(status) FOR UPDATE SKIP LOCKED",
+            "SELECT id FROM swift_jobs WHERE status = \(status) FOR UPDATE SKIP LOCKED",
             logger: self.logger
         )
         var jobs: [JobID] = []
@@ -300,18 +381,18 @@ public final class PostgresJobQueue: JobQueueDriver {
         switch onInit {
         case .remove:
             try await connection.query(
-                "DELETE FROM _hb_pg_jobs WHERE status = \(status) ",
+                "DELETE FROM swift_jobs WHERE status = \(status)",
                 logger: self.logger
             )
 
         case .rerun:
             guard status != .pending else { return }
 
-            let jobs = try await getJobs(withStatus: status)
-            self.logger.info("Moving \(jobs.count) jobs with status: \(status) to job queue")
-            for jobId in jobs {
-                try await self.addToQueue(jobId: jobId, connection: connection, delayUntil: nil)
-            }
+                let jobs = try await getJobs(withStatus: status)
+                self.logger.info("Moving \(jobs.count) jobs with status: \(status) to status QUEUED")
+                for jobId in jobs {
+                    try await self.setStatus(jobId: jobId, status: .pending, connection: connection)
+                }
 
         case .doNothing:
             break
@@ -331,7 +412,8 @@ extension PostgresJobQueue {
                 if self.queue.isStopped.withLockedValue({ $0 }) {
                     return nil
                 }
-
+                // it would be nice to return queue.pop().next()
+                // so that we can improve thoughput
                 if let job = try await queue.popFirst() {
                     return job
                 }

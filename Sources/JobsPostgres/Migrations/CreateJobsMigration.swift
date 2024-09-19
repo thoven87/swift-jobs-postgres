@@ -16,23 +16,36 @@ import Logging
 import PostgresMigrations
 import PostgresNIO
 
-struct CreateJobs: DatabaseMigration {
+struct CreateJobsMigration: DatabaseMigration {
     func apply(connection: PostgresConnection, logger: Logger) async throws {
         try await connection.query(
             """
-            CREATE TABLE IF NOT EXISTS _hb_pg_jobs (
-                id uuid PRIMARY KEY,
-                job bytea,
-                status smallint,
-                lastModified TIMESTAMPTZ DEFAULT NOW()
-            )     
+            CREATE TABLE IF NOT EXISTS swift_jobs (
+                id UUID NOT NULL PRIMARY KEY,
+                job_name VARCHAR(255) NOT NULL,
+                payload BYTEA NOT NULL,
+                status SMALLINT NOT NULL,
+                did_pause BOOLEAN NOT NULL DEFAULT FALSE,
+                priority INTEGER NOT NULL DEFAULT 10,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() NOT NULL,
+                delayed_until TIMESTAMPTZ,
+                debounce_key TEXT NOT NULL UNIQUE
+            );
             """,
             logger: logger
         )
         try await connection.query(
             """
-            CREATE INDEX IF NOT EXISTS _hb_job_status
-            ON _hb_pg_jobs(status)
+            CREATE INDEX IF NOT EXISTS _hb_job_status_idx
+            ON swift_jobs(status)
+            """,
+            logger: logger
+        )
+        try await connection.query(
+            """
+            CREATE INDEX IF NOT EXISTS _hb_job_filter_idx
+            ON swift_jobs(priority, created_at, delayed_until)
             """,
             logger: logger
         )
@@ -40,7 +53,7 @@ struct CreateJobs: DatabaseMigration {
 
     func revert(connection: PostgresConnection, logger: Logger) async throws {
         try await connection.query(
-            "DROP TABLE _hb_pg_jobs",
+            "DROP TABLE swift_jobs",
             logger: logger
         )
     }
@@ -51,5 +64,5 @@ struct CreateJobs: DatabaseMigration {
 
 extension DatabaseMigrationGroup {
     /// JobQueue migration group
-    public static var jobQueue: Self { .init("_hb_jobqueue") }
+    public static var jobQueue: Self { .init("swift_jobs") }
 }

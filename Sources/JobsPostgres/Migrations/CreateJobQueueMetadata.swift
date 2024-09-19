@@ -22,7 +22,7 @@ struct CreateJobQueueMetadata: DatabaseMigration {
             """
             CREATE TABLE IF NOT EXISTS _hb_pg_job_queue_metadata (
                 key text PRIMARY KEY,
-                value bytea
+                value bytea NOT NULL
             )
             """,
             logger: logger
