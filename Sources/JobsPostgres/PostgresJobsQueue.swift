@@ -132,11 +132,9 @@ public final class PostgresJobQueue: JobQueueDriver {
     /// Push Job onto queue
     /// - Returns: Identifier of queued job
     @discardableResult public func push(_ buffer: ByteBuffer, options: JobOptions) async throws -> JobID {
-        return try await self.client.withConnection { connection in
-            let queuedJob = QueuedJob<JobID>(id: .init(), jobBuffer: buffer)
-            try await self.addJob(queuedJob, buffer: buffer, options: options, connection: self.client)
-            return queuedJob.id
-        }
+        let queuedJob = QueuedJob<JobID>(id: .init(), jobBuffer: buffer)
+        try await self.addJob(queuedJob, buffer: buffer, options: options)
+        return queuedJob.id
     }
 
     /// This is called to say job has finished processing and it can be deleted
@@ -309,13 +307,13 @@ public final class PostgresJobQueue: JobQueueDriver {
         }
     }
 
-    func addJob(_ job: QueuedJob<JobID>, buffer: ByteBuffer, options: JobOptions, connection: PostgresClient) async throws {
+    func addJob(_ job: QueuedJob<JobID>, buffer: ByteBuffer, options: JobOptions) async throws {
         // TODO: use just buffer and status
         let key = "\(buffer)\(Status.pending)\(job.id)"
         let debouceKey = SHA256.hash(data: Data(key.utf8)).compactMap {
             String(format: "%02x", $0)
         }.joined()
-        try await connection.query(
+        try await self.client.query(
             """
             INSERT INTO swift_jobs (
                 id,
