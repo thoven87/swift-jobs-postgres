@@ -184,11 +184,10 @@ public final class PostgresJobQueue: JobQueueDriver {
             let result = try await self.client.withTransaction(logger: self.logger) { connection -> Result<QueuedJob<JobID>?, Error> in
                 while true {
                     try Task.checkCancellation()
-                    
+
                     var maybeFailedJobId: JobID? = nil
 
                     do {
-                        
                         let stream = try await connection.query(
                             """
                             WITH eligible_jobs AS (
@@ -211,15 +210,15 @@ public final class PostgresJobQueue: JobQueueDriver {
                         )
                         // return nil if nothing is in the queue
                         let (jobId, buffer) = try await stream.decode((UUID, ByteBuffer).self, context: .default).first(where: { _ in true }) ?? (nil, nil)
-                        
+
                         guard let jobId else {
                             // return nil if nothing in queue
                             return Result.success(nil)
                         }
-                        
+
                         maybeFailedJobId = jobId
-                        
-                        guard let buffer = buffer else {
+
+                        guard let buffer else {
                             continue
                         }
                         return Result.success(QueuedJob(id: jobId, jobBuffer: buffer))
@@ -245,17 +244,17 @@ public final class PostgresJobQueue: JobQueueDriver {
             throw error
         }
     }
-    /// TODO use this func for concurency 
+
+    // TODO: use this func for concurency
     func popMany() async throws -> [QueuedJob<JobID>]? {
         do {
             let result = try await self.client.withTransaction(logger: self.logger) { connection -> Result<[QueuedJob<JobID>]?, Error> in
                 while true {
                     try Task.checkCancellation()
-                    
+
                     var jobs: [QueuedJob<JobID>] = []
-                    
+
                     do {
-                        
                         let stream = try await connection.query(
                             """
                             WITH eligible_jobs AS (
@@ -276,16 +275,16 @@ public final class PostgresJobQueue: JobQueueDriver {
                             """,
                             logger: self.logger
                         )
-                        
+
                         for try await (jobId, buffer) in stream.decode((UUID, ByteBuffer).self) {
                             jobs.append(QueuedJob(id: jobId, jobBuffer: buffer))
                         }
-                        
+
                         guard !jobs.isEmpty else {
                             // return nil if nothing in queue
                             return Result.success(nil)
                         }
-                        
+
                         return Result.success(jobs)
                     } catch {
                         /// Job Id should be set if we get here
@@ -312,7 +311,7 @@ public final class PostgresJobQueue: JobQueueDriver {
 
     func addJob(_ job: QueuedJob<JobID>, buffer: ByteBuffer, options: JobOptions, connection: PostgresClient) async throws {
         // TODO: use just buffer and status
-        let key: String = "\(buffer)\(Status.pending)\(job.id)"
+        let key = "\(buffer)\(Status.pending)\(job.id)"
         let debouceKey = SHA256.hash(data: Data(key.utf8)).compactMap {
             String(format: "%02x", $0)
         }.joined()
@@ -339,7 +338,7 @@ public final class PostgresJobQueue: JobQueueDriver {
             ON CONFLICT (debounce_key)
             DO UPDATE SET delayed_until = \(options.delayUntil), updated_at = \(Date.now)
             """,
-            logger: logger
+            logger: self.logger
         )
     }
 
@@ -349,7 +348,6 @@ public final class PostgresJobQueue: JobQueueDriver {
             logger: self.logger
         )
     }
-
 
     func setStatus(jobId: JobID, status: Status, connection: PostgresConnection) async throws {
         try await connection.query(
@@ -388,11 +386,11 @@ public final class PostgresJobQueue: JobQueueDriver {
         case .rerun:
             guard status != .pending else { return }
 
-                let jobs = try await getJobs(withStatus: status)
-                self.logger.info("Moving \(jobs.count) jobs with status: \(status) to status QUEUED")
-                for jobId in jobs {
-                    try await self.setStatus(jobId: jobId, status: .pending, connection: connection)
-                }
+            let jobs = try await getJobs(withStatus: status)
+            self.logger.info("Moving \(jobs.count) jobs with status: \(status) to status QUEUED")
+            for jobId in jobs {
+                try await self.setStatus(jobId: jobId, status: .pending, connection: connection)
+            }
 
         case .doNothing:
             break
